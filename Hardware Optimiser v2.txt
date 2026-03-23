@@ -1,0 +1,1459 @@
+"""
+hardware_optimiser.py
+=====================
+Abstract, domain-agnostic hardware design optimiser — v4.
+
+Supported domains  (--domain):
+  nozzle            – de Laval rocket / supersonic nozzle
+  electric_motor    – surface-mount PMSM sizing model
+  centrifugal_pump  – single-stage centrifugal pump impeller
+
+Optimisation modes  (--mode):
+  single            – SLSQP from default / config start point
+  monte_carlo       – Latin-Hypercube multi-start  + SLSQP
+  sobol             – Sobol quasi-random multi-start + SLSQP
+  differential_evo  – SciPy differential evolution (global) then SLSQP polish
+
+Post-optimisation analysis:
+  --tolerance-mc N  – tolerance / manufacturing Monte-Carlo around the best
+                      design (perturbs parameters by gaussian noise, reports
+                      pass rate and KPI statistics)
+
+Config file  (JSON or YAML, --config FILE):
+  params:  { key: value }   – fixed / initial parameter overrides
+  bounds:  { key: [lo, hi] }– design-variable bound overrides
+  weights: { kpi_name: w }  – objective weight overrides
+  tols:    { param: sigma_frac } – tolerance sigma as fraction of nominal
+
+Run examples
+------------
+  python hardware_optimiser.py --domain electric_motor
+  python hardware_optimiser.py --domain nozzle --mode sobol --n-runs 64 --seed 7
+  python hardware_optimiser.py --domain centrifugal_pump --mode differential_evo
+  python hardware_optimiser.py --domain electric_motor --tolerance-mc 2000 --seed 0
+  python hardware_optimiser.py --test
+
+Modularised-monolithic structure
+---------------------------------
+  §1   Imports & logging
+  §2   Config loading  (JSON / YAML)
+  §3   Per-domain input / output dataclasses
+  §4   Per-domain PhysicsRegistry  (no global singleton)
+  §5   Abstract interfaces
+  §6   Weighted / normalised objective framework
+  §7   Generic SLSQP optimizer
+  §8   Differential Evolution + SLSQP polish optimizer
+  §9   Sampling engine  (LHS / Sobol multi-start)
+  §10  Manufacturing tolerance Monte-Carlo
+  §11  Nozzle domain
+  §12  Electric Motor domain
+  §13  Centrifugal Pump domain
+  §14  Domain factory
+  §15  Runner
+  §16  Unit tests  (--test flag)
+  §17  CLI entry-point
+"""
+
+# =============================================================================
+# §1  IMPORTS & LOGGING
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import time
+import traceback as _tb
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+
+import numpy as np
+from scipy.optimize import brentq, differential_evolution, minimize
+from scipy.stats import qmc
+
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("hardware_optimiser")
+
+
+# =============================================================================
+# §2  CONFIG LOADING
+# =============================================================================
+
+
+@dataclass
+class DomainConfig:
+    params:  Dict[str, float]               = field(default_factory=dict)
+    bounds:  Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    weights: Dict[str, float]               = field(default_factory=dict)
+    tols:    Dict[str, float]               = field(default_factory=dict)
+
+    @classmethod
+    def empty(cls) -> "DomainConfig":
+        return cls()
+
+    @classmethod
+    def from_file(cls, path: str) -> "DomainConfig":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Config not found: {path}")
+        if p.suffix in (".yaml", ".yml"):
+            if not _YAML_AVAILABLE:
+                raise ImportError("PyYAML required. pip install pyyaml")
+            with p.open() as fh:
+                raw: Dict[str, Any] = yaml.safe_load(fh) or {}
+        elif p.suffix == ".json":
+            with p.open() as fh:
+                raw = json.load(fh)
+        else:
+            raise ValueError(f"Unsupported config format: {p.suffix}")
+
+        def _fdict(section: str) -> Dict[str, float]:
+            out: Dict[str, float] = {}
+            for k, v in (raw.get(section) or {}).items():
+                try:
+                    out[str(k)] = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Config {section}['{k}'] must be numeric.") from exc
+            return out
+
+        bounds: Dict[str, Tuple[float, float]] = {}
+        for k, v in (raw.get("bounds") or {}).items():
+            try:
+                lo, hi = float(v[0]), float(v[1])
+            except Exception as exc:
+                raise ValueError(f"Config bounds['{k}'] must be [lo,hi].") from exc
+            if lo >= hi:
+                raise ValueError(f"Config bounds['{k}']: lo must be < hi.")
+            bounds[str(k)] = (lo, hi)
+
+        return cls(params=_fdict("params"), bounds=bounds,
+                   weights=_fdict("weights"), tols=_fdict("tols"))
+
+    @classmethod
+    def from_file_or_empty(cls, path: Optional[str]) -> "DomainConfig":
+        return cls.from_file(path) if path is not None else cls.empty()
+
+
+# =============================================================================
+# §3  PER-DOMAIN INPUT / OUTPUT DATACLASSES
+# =============================================================================
+
+def _to_dict(obj: Any) -> Dict[str, float]:
+    return {f.name: getattr(obj, f.name) for f in fields(obj)}
+
+def _from_dict(cls: Type, d: Dict[str, float]) -> Any:
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass(frozen=True)
+class NozzleParams:
+    gamma: float = 1.24;    R: float = 400.0;   T0: float = 3500.0
+    P0: float = 10.0e6;     Pa: float = 101325.0; m_dot: float = 5.0
+    throat_radius: float = 0.05;  Me: float = 3.0
+
+    def to_dict(self) -> Dict[str, float]: return _to_dict(self)
+    @classmethod
+    def from_dict(cls, d: Dict[str, float]) -> "NozzleParams": return _from_dict(cls, d)
+
+
+@dataclass(frozen=True)
+class NozzleResults:
+    exit_mach: float;        exit_velocity: float;   thrust: float
+    specific_impulse: float; area_ratio: float;       mass: float
+    throat_radius: float;    exit_radius: float;      nozzle_length: float
+
+    def scalar_metrics(self) -> Dict[str, float]: return asdict(self)
+
+
+@dataclass(frozen=True)
+class MotorParams:
+    pole_pairs: float = 4.0;       turns_per_phase: float = 12.0
+    winding_factor: float = 0.933; omega_mech: float = 300.0
+    rotor_radius: float = 0.07;    stack_length: float = 0.12
+    B_gap: float = 0.85;           current_q: float = 200.0
+
+    def to_dict(self) -> Dict[str, float]: return _to_dict(self)
+    @classmethod
+    def from_dict(cls, d: Dict[str, float]) -> "MotorParams": return _from_dict(cls, d)
+
+
+@dataclass(frozen=True)
+class MotorResults:
+    flux_linkage_pm: float; torque: float;         power: float
+    power_density: float;   current_density: float; mass: float
+    r_rotor: float;         r_stator_inner: float;  r_stator_outer: float
+    stack_length: float;    slot_area: float
+
+    def scalar_metrics(self) -> Dict[str, float]: return asdict(self)
+
+
+@dataclass(frozen=True)
+class PumpParams:
+    flow_rate_m3s: float = 0.05;          fluid_density_kgm3: float = 998.0
+    target_head_m: float = 50.0;          impeller_diameter_m: float = 0.25
+    blade_angle_deg: float = 30.0;        rotational_speed_rpm: float = 1450.0
+    inlet_diameter_ratio: float = 0.45;   blade_width_ratio: float = 0.10
+    n_blades: float = 6.0;                slip_factor_model: float = 0.9
+
+    def to_dict(self) -> Dict[str, float]: return _to_dict(self)
+    @classmethod
+    def from_dict(cls, d: Dict[str, float]) -> "PumpParams": return _from_dict(cls, d)
+
+
+@dataclass(frozen=True)
+class PumpResults:
+    head_m: float;              shaft_power_W: float
+    hydraulic_efficiency: float; specific_speed: float
+    tip_speed_m_s: float;        mass_impeller_kg: float
+    power_per_kg_W_kg: float;    npsh_r_m: float
+
+    def scalar_metrics(self) -> Dict[str, float]: return asdict(self)
+
+
+# =============================================================================
+# §4  PER-DOMAIN PhysicsRegistry
+# =============================================================================
+
+PhysicsFunc = Callable[[Dict[str, float]], float]
+
+
+class PhysicsRegistry:
+    def __init__(self, domain_name: str) -> None:
+        self._name = domain_name
+        self._reg: Dict[str, PhysicsFunc] = {}
+
+    def register(self, quantities: Dict[str, PhysicsFunc]) -> None:
+        dup = set(quantities) & set(self._reg)
+        if dup:
+            log.warning("PhysicsRegistry[%s]: overwriting %s.", self._name, dup)
+        self._reg.update(quantities)
+
+    def evaluate(self, quantity: str, subs: Dict[str, float]) -> float:
+        if quantity not in self._reg:
+            raise KeyError(f"PhysicsRegistry[{self._name}]: '{quantity}' not found. "
+                           f"Available: {sorted(self._reg)}")
+        return self._reg[quantity](subs)
+
+    def __repr__(self) -> str:
+        return f"PhysicsRegistry({self._name!r}, {sorted(self._reg)})"
+
+
+# =============================================================================
+# §5  ABSTRACT INTERFACES
+# =============================================================================
+
+
+class AbstractAxioms(ABC):
+    @abstractmethod
+    def evaluate(self, quantity: str, subs: Dict[str, float]) -> float: ...
+
+
+class AbstractConstraints(ABC):
+    pass
+
+
+class AbstractGeometryGenerator(ABC):
+    @abstractmethod
+    def generate_geometry(self, params: Dict[str, float]) -> Dict[str, float]: ...
+    @abstractmethod
+    def calculate_mass(self, geo: Dict[str, float], params: Dict[str, float]) -> float: ...
+    @abstractmethod
+    def export_geometry(self, geo: Dict[str, float]) -> str: ...
+
+
+class AbstractSimulator(ABC):
+    @abstractmethod
+    def simulate(self, params: Dict[str, float]) -> Dict[str, float]: ...
+
+
+class AbstractEvaluator(ABC):
+    @abstractmethod
+    def evaluate(self, params: Dict[str, float]) -> Dict[str, Any]: ...
+
+    @property
+    @abstractmethod
+    def tolerance_params(self) -> List[str]: ...
+
+
+class AbstractOptimizer(ABC):
+    @abstractmethod
+    def optimize_design(self, initial_params: Dict[str, float],
+                        x0_override: Optional[np.ndarray] = None) -> "OptimResult": ...
+
+
+@dataclass
+class OptimResult:
+    optimized_params: Dict[str, float]
+    results:          Dict[str, Any]
+    objective_value:  float
+    success:          bool
+    message:          str
+    n_iter:           int
+    elapsed_s:        float
+
+    def scalar_results(self) -> Dict[str, float]:
+        return {k: float(v) for k, v in self.results.items()
+                if isinstance(v, (int, float)) and k != "geometry"}
+
+
+class HardwareDomain(ABC):
+    def __init__(self, config: DomainConfig) -> None:
+        self._config = config
+
+    @property
+    @abstractmethod
+    def axioms(self) -> AbstractAxioms: ...
+    @property
+    @abstractmethod
+    def constraints(self) -> AbstractConstraints: ...
+    @property
+    @abstractmethod
+    def geometry_generator(self) -> AbstractGeometryGenerator: ...
+    @property
+    @abstractmethod
+    def evaluator(self) -> AbstractEvaluator: ...
+    @property
+    @abstractmethod
+    def optimizer(self) -> AbstractOptimizer: ...
+    @property
+    @abstractmethod
+    def design_vars(self) -> List[Tuple[str, Tuple[float, float]]]: ...
+    @property
+    @abstractmethod
+    def constraint_funcs(self) -> List[Callable[[np.ndarray, Dict[str, float]], float]]: ...
+    @property
+    @abstractmethod
+    def default_weights(self) -> Dict[str, float]: ...
+    @property
+    @abstractmethod
+    def default_params(self) -> Dict[str, float]: ...
+
+    def effective_params(self) -> Dict[str, float]:
+        return {**self.default_params, **self._config.params}
+
+    def effective_design_vars(self) -> List[Tuple[str, Tuple[float, float]]]:
+        return [(n, self._config.bounds.get(n, b)) for n, b in self.design_vars]
+
+    def effective_weights(self) -> Dict[str, float]:
+        return {**self.default_weights, **self._config.weights}
+
+    def default_tols(self) -> Dict[str, float]:
+        return {}
+
+    def _build_objective(self) -> "WeightedObjective":
+        raise NotImplementedError
+
+
+# =============================================================================
+# §6  WEIGHTED / NORMALISED OBJECTIVE FRAMEWORK
+# =============================================================================
+
+
+@dataclass
+class ObjectiveTerm:
+    kpi_key:    str
+    weight:     float
+    nominal:    float                        = 1.0
+    constraint: Optional[Tuple[str, float]] = None   # ("ge"|"le", bound)
+    penalty_k:  float                        = 100.0
+
+
+class WeightedObjective:
+    """
+    Normalised weighted objective — no hand-tuned scale factors.
+
+    Each term contributes:
+        w_i * (result[kpi_i] - nominal_i) / |nominal_i|
+
+    Soft constraint penalty added when violated:
+        penalty_k * |violation_fraction|
+
+    Weights may be overridden per-run via DomainConfig.weights.
+    """
+
+    def __init__(self, terms: List[ObjectiveTerm],
+                 weight_overrides: Dict[str, float]) -> None:
+        self._terms: List[ObjectiveTerm] = []
+        for t in terms:
+            w = weight_overrides.get(t.kpi_key, t.weight)
+            self._terms.append(ObjectiveTerm(t.kpi_key, w, t.nominal, t.constraint, t.penalty_k))
+
+    def __call__(self, results: Dict[str, Any]) -> float:
+        total = 0.0
+        for t in self._terms:
+            val = results.get(t.kpi_key, 0.0)
+            denom = abs(t.nominal) if t.nominal != 0.0 else 1.0
+            total += t.weight * (val - t.nominal) / denom
+            if t.constraint is not None:
+                sense, bound = t.constraint
+                denom_c = abs(bound) if bound != 0.0 else 1.0
+                if sense == "ge" and val < bound:
+                    total += t.penalty_k * (bound - val) / denom_c
+                elif sense == "le" and val > bound:
+                    total += t.penalty_k * (val - bound) / denom_c
+        return total
+
+    def constraint_funcs_from_terms(
+        self,
+        evaluator: AbstractEvaluator,
+        design_vars: List[Tuple[str, Tuple[float, float]]],
+    ) -> List[Callable[[np.ndarray, Dict[str, float]], float]]:
+        funcs = []
+        for t in self._terms:
+            if t.constraint is None:
+                continue
+            sense, bound = t.constraint
+            kpi = t.kpi_key
+
+            def _make(k: str, s: str, b: float):
+                def _con(x: np.ndarray, base: Dict[str, float]) -> float:
+                    p = dict(base)
+                    for i, (n, _) in enumerate(design_vars):
+                        p[n] = float(x[i])
+                    v = evaluator.evaluate(p).get(k, 0.0)
+                    return (v - b) if s == "ge" else (b - v)
+                return _con
+
+            funcs.append(_make(kpi, sense, bound))
+        return funcs
+
+
+# =============================================================================
+# §7  GENERIC SLSQP OPTIMIZER
+# =============================================================================
+
+
+class GenericOptimizer(AbstractOptimizer):
+    def __init__(self, evaluator: AbstractEvaluator,
+                 objective: Callable[[Dict[str, Any]], float],
+                 constraint_funcs: List[Callable[[np.ndarray, Dict[str, float]], float]],
+                 design_vars: List[Tuple[str, Tuple[float, float]]]) -> None:
+        self._ev    = evaluator
+        self._obj   = objective
+        self._cons  = constraint_funcs
+        self._dvars = design_vars
+
+    def _unpack(self, x: np.ndarray, base: Dict[str, float]) -> Dict[str, float]:
+        p = dict(base)
+        for i, (n, _) in enumerate(self._dvars):
+            p[n] = float(x[i])
+        return p
+
+    def optimize_design(self, initial_params: Dict[str, float],
+                        x0_override: Optional[np.ndarray] = None) -> OptimResult:
+        x0 = x0_override if x0_override is not None else np.array(
+            [initial_params.get(n, 0.5*(lo+hi)) for n, (lo, hi) in self._dvars])
+        bounds = [b for _, b in self._dvars]
+        cons   = [{"type": "ineq", "fun": f, "args": (initial_params,)} for f in self._cons]
+        t0 = time.perf_counter()
+        res = minimize(
+            lambda x, b: self._obj(self._ev.evaluate(self._unpack(x, b))),
+            x0, args=(initial_params,), bounds=bounds, constraints=cons,
+            method="SLSQP", options={"ftol": 1e-9, "maxiter": 500})
+        elapsed    = time.perf_counter() - t0
+        opt_params = self._unpack(res.x, initial_params)
+        return OptimResult(
+            optimized_params=opt_params, results=self._ev.evaluate(opt_params),
+            objective_value=float(res.fun), success=bool(res.success),
+            message=str(res.message), n_iter=int(res.nit), elapsed_s=elapsed)
+
+
+# =============================================================================
+# §8  DIFFERENTIAL EVOLUTION + SLSQP POLISH OPTIMIZER
+# =============================================================================
+
+
+class DifferentialEvolutionOptimizer(AbstractOptimizer):
+    """
+    Global search via scipy.optimize.differential_evolution followed by
+    an SLSQP polish pass.
+
+    During DE the constraints are penalised with a large exterior coefficient
+    (DE has no native inequality-constraint support).  The SLSQP pass then
+    enforces them properly.
+    """
+
+    def __init__(self, evaluator: AbstractEvaluator,
+                 objective: Callable[[Dict[str, Any]], float],
+                 constraint_funcs: List[Callable[[np.ndarray, Dict[str, float]], float]],
+                 design_vars: List[Tuple[str, Tuple[float, float]]],
+                 de_popsize: int = 15, de_maxiter: int = 300,
+                 de_tol: float = 1e-7, de_seed: int = 0) -> None:
+        self._ev        = evaluator
+        self._obj       = objective
+        self._cons      = constraint_funcs
+        self._dvars     = design_vars
+        self._popsize   = de_popsize
+        self._maxiter   = de_maxiter
+        self._de_tol    = de_tol
+        self._de_seed   = de_seed
+
+    def _unpack(self, x: np.ndarray, base: Dict[str, float]) -> Dict[str, float]:
+        p = dict(base)
+        for i, (n, _) in enumerate(self._dvars):
+            p[n] = float(x[i])
+        return p
+
+    def _penalised(self, x: np.ndarray, base: Dict[str, float], pen: float = 1e6) -> float:
+        obj = self._obj(self._ev.evaluate(self._unpack(x, base)))
+        for f in self._cons:
+            v = f(x, base)
+            if v < 0.0:
+                obj += pen * v ** 2
+        return obj
+
+    def optimize_design(self, initial_params: Dict[str, float],
+                        x0_override: Optional[np.ndarray] = None) -> OptimResult:
+        bounds = [b for _, b in self._dvars]
+        t0     = time.perf_counter()
+        log.info("DE: popsize=%d maxiter=%d seed=%d dims=%d",
+                 self._popsize, self._maxiter, self._de_seed, len(self._dvars))
+
+        de_res = differential_evolution(
+            self._penalised, bounds, args=(initial_params,),
+            popsize=self._popsize, maxiter=self._maxiter, tol=self._de_tol,
+            seed=self._de_seed, polish=False,
+            mutation=(0.5, 1.0), recombination=0.7, workers=1)
+        log.info("DE done: obj=%.4g  nfev=%d", de_res.fun, de_res.nfev)
+
+        cons_scipy = [{"type": "ineq", "fun": f, "args": (initial_params,)}
+                      for f in self._cons]
+        pol = minimize(
+            lambda x, b: self._obj(self._ev.evaluate(self._unpack(x, b))),
+            de_res.x, args=(initial_params,), bounds=bounds,
+            constraints=cons_scipy, method="SLSQP",
+            options={"ftol": 1e-10, "maxiter": 500})
+
+        elapsed    = time.perf_counter() - t0
+        best_x     = pol.x if pol.fun <= de_res.fun else de_res.x
+        opt_params = self._unpack(best_x, initial_params)
+        return OptimResult(
+            optimized_params=opt_params, results=self._ev.evaluate(opt_params),
+            objective_value=float(min(pol.fun, de_res.fun)),
+            success=bool(pol.success or de_res.success),
+            message=f"DE nfev={de_res.nfev}; polish: {pol.message}",
+            n_iter=int(de_res.nit + pol.nit), elapsed_s=elapsed)
+
+
+# =============================================================================
+# §9  SAMPLING ENGINE  (LHS / Sobol multi-start)
+# =============================================================================
+
+SamplingMode = str
+
+
+def _lhs(n: int, d: int, seed: int) -> np.ndarray:
+    return qmc.LatinHypercube(d=d, seed=seed).random(n=n)
+
+def _sobol(n: int, d: int, seed: int) -> np.ndarray:
+    m = math.ceil(math.log2(max(n, 2)))
+    return qmc.Sobol(d=d, scramble=True, seed=seed).random_base2(m=m)[:n]
+
+def _scale(unit: np.ndarray, bounds: List[Tuple[float, float]]) -> np.ndarray:
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+    return lo + unit * (hi - lo)
+
+
+@dataclass
+class MultiStartResults:
+    all_runs: List[OptimResult];   best: OptimResult
+    n_converged: int;              mode: SamplingMode
+    n_runs: int;                   seed: int
+    total_elapsed_s: float
+
+    def summary_table(self) -> str:
+        hdr = f"{'Run':>4}  {'Conv':>4}  {'Iters':>5}  {'Objective':>14}  {'Time(s)':>9}"
+        sep = "-" * len(hdr)
+        rows = [hdr, sep]
+        for i, r in enumerate(self.all_runs):
+            rows.append(f"{i+1:>4}  {'YES' if r.success else 'NO ':>4}  {r.n_iter:>5}  "
+                        f"{r.objective_value:>14.6g}  {r.elapsed_s:>9.3f}")
+        rows += [sep, f"Best obj={self.best.objective_value:.6g}  |  "
+                      f"Converged: {self.n_converged}/{self.n_runs}  |  "
+                      f"Total: {self.total_elapsed_s:.2f}s"]
+        return "\n".join(rows)
+
+
+def run_multistart(optimizer: AbstractOptimizer, base_params: Dict[str, float],
+                   design_vars: List[Tuple[str, Tuple[float, float]]],
+                   mode: SamplingMode, n_runs: int, seed: int) -> MultiStartResults:
+    d, bounds = len(design_vars), [b for _, b in design_vars]
+    pts = _scale((_lhs if mode == "monte_carlo" else _sobol)(n_runs, d, seed), bounds)
+    log.info("Multi-start [%s]: %d runs, seed=%d, %d vars", mode, n_runs, seed, d)
+    all_runs: List[OptimResult] = []
+    t0 = time.perf_counter()
+    for i, x0 in enumerate(pts):
+        log.debug("  run %d/%d  x0=%s", i+1, n_runs, np.round(x0, 4))
+        all_runs.append(optimizer.optimize_design(base_params, x0_override=x0))
+    total = time.perf_counter() - t0
+    converged = [r for r in all_runs if r.success]
+    best = min(converged or all_runs, key=lambda r: r.objective_value)
+    return MultiStartResults(all_runs=all_runs, best=best, n_converged=len(converged),
+                             mode=mode, n_runs=n_runs, seed=seed, total_elapsed_s=total)
+
+
+# =============================================================================
+# §10  MANUFACTURING TOLERANCE MONTE-CARLO
+# =============================================================================
+
+
+@dataclass
+class ToleranceMCResults:
+    n_samples:    int;   pass_rate: float
+    kpi_mean:     Dict[str, float];  kpi_std:  Dict[str, float]
+    kpi_p05:      Dict[str, float];  kpi_p95:  Dict[str, float]
+    tols_used:    Dict[str, float];  elapsed_s: float
+
+    def report(self) -> str:
+        lines = [
+            f"  Tolerance Monte-Carlo  ({self.n_samples} samples)",
+            f"  Pass rate            = {self.pass_rate * 100:.1f} %",
+            f"  Tolerance σ (frac.)  = "
+            + str({k: f"{v:.4f}" for k, v in self.tols_used.items()}),
+            "",
+            f"  {'KPI':<30}  {'Mean':>12}  {'Std':>10}  {'P05':>12}  {'P95':>12}",
+            "  " + "-" * 70,
+        ]
+        for k in self.kpi_mean:
+            lines.append(f"  {k:<30}  {self.kpi_mean[k]:>12.5g}  {self.kpi_std[k]:>10.4g}"
+                         f"  {self.kpi_p05[k]:>12.5g}  {self.kpi_p95[k]:>12.5g}")
+        lines.append(f"\n  Elapsed: {self.elapsed_s:.2f}s")
+        return "\n".join(lines)
+
+
+def run_tolerance_mc(
+    best_params: Dict[str, float], evaluator: AbstractEvaluator,
+    constraint_funcs: List[Callable[[np.ndarray, Dict[str, float]], float]],
+    design_vars: List[Tuple[str, Tuple[float, float]]],
+    tols: Dict[str, float], n_samples: int, seed: int,
+) -> ToleranceMCResults:
+    rng        = np.random.default_rng(seed)
+    tol_names  = list(tols.keys())
+    tol_sigmas = np.array([abs(best_params.get(k, 1.0)) * tols[k] for k in tol_names])
+    dvar_names = [n for n, _ in design_vars]
+    x_best     = np.array([best_params.get(n, 0.0) for n in dvar_names])
+    perturbs   = rng.normal(0.0, tol_sigmas, size=(n_samples, len(tol_names)))
+
+    all_scalar: List[Dict[str, float]] = []
+    n_pass = 0
+    t0 = time.perf_counter()
+
+    for delta in perturbs:
+        p = dict(best_params)
+        for i, name in enumerate(tol_names):
+            p[name] = best_params.get(name, 0.0) + delta[i]
+        try:
+            result   = evaluator.evaluate(p)
+            feasible = all(f(x_best, p) >= -1e-6 for f in constraint_funcs)
+            if feasible:
+                n_pass += 1
+            all_scalar.append({k: float(v) for k, v in result.items()
+                                if isinstance(v, (int, float)) and k != "geometry"})
+        except Exception:
+            pass
+
+    elapsed = time.perf_counter() - t0
+    if not all_scalar:
+        raise RuntimeError("Tolerance MC: no valid samples produced.")
+
+    keys = list(all_scalar[0].keys())
+    arr  = np.array([[s.get(k, float("nan")) for k in keys] for s in all_scalar])
+    return ToleranceMCResults(
+        n_samples=n_samples, pass_rate=n_pass / max(len(all_scalar), 1),
+        kpi_mean={k: float(np.nanmean(arr[:, i]))         for i, k in enumerate(keys)},
+        kpi_std= {k: float(np.nanstd(arr[:, i]))          for i, k in enumerate(keys)},
+        kpi_p05= {k: float(np.nanpercentile(arr[:, i],  5)) for i, k in enumerate(keys)},
+        kpi_p95= {k: float(np.nanpercentile(arr[:, i], 95)) for i, k in enumerate(keys)},
+        tols_used=dict(tols), elapsed_s=elapsed)
+
+
+# =============================================================================
+# §11  NOZZLE DOMAIN
+# =============================================================================
+
+def _nozzle_exit_mach(subs: Dict[str, float]) -> float:
+    if "area_ratio" not in subs:
+        return subs["Me"]
+    gamma, ar = subs["gamma"], subs["area_ratio"]
+    gp1, gm1  = gamma + 1.0, gamma - 1.0
+    def _f(M: float) -> float:
+        return ((2.0/gp1)*(1.0+0.5*gm1*M*M))**(0.5*gp1/gm1)/M - ar
+    return brentq(_f, 1.001, 20.0)
+
+def _nozzle_exit_velocity(subs: Dict[str, float]) -> float:
+    gamma, R, T0, Me = subs["gamma"], subs["R"], subs["T0"], subs["Me"]
+    Te = T0 / (1.0 + 0.5*(gamma-1.0)*Me**2)
+    return Me * math.sqrt(gamma * R * Te)
+
+def _nozzle_thrust(subs: Dict[str, float]) -> float:
+    gamma, P0, Pa, Me = subs["gamma"], subs["P0"], subs["Pa"], subs["Me"]
+    Pe = P0 * (1.0+0.5*(gamma-1.0)*Me**2)**(-(gamma/(gamma-1.0)))
+    Ae = math.pi * subs["throat_radius"]**2 * subs["area_ratio"]
+    return subs["m_dot"] * subs["exit_velocity"] + (Pe - Pa) * Ae
+
+def _nozzle_specific_impulse(subs: Dict[str, float]) -> float:
+    return subs["thrust"] / (subs["m_dot"] * 9.80665)
+
+def _build_nozzle_registry() -> PhysicsRegistry:
+    reg = PhysicsRegistry("nozzle")
+    reg.register({"exit_mach": _nozzle_exit_mach, "exit_velocity": _nozzle_exit_velocity,
+                  "thrust": _nozzle_thrust, "specific_impulse": _nozzle_specific_impulse})
+    return reg
+
+
+class NozzleAxioms(AbstractAxioms):
+    def __init__(self) -> None: self._reg = _build_nozzle_registry()
+    def evaluate(self, q: str, s: Dict[str, float]) -> float: return self._reg.evaluate(q, s)
+
+
+@dataclass
+class NozzleConstraints(AbstractConstraints):
+    min_exit_mach: float = 2.0;          max_exit_mach: float = 5.0
+    min_specific_impulse_s: float = 200.0; material_density_kg_m3: float = 8900.0
+    wall_thickness_m: float = 0.005;     half_cone_angle_deg: float = 15.0
+
+
+class NozzleGeometryGenerator(AbstractGeometryGenerator):
+    def __init__(self, c: NozzleConstraints) -> None: self._c = c
+
+    def generate_geometry(self, params: Dict[str, float]) -> Dict[str, float]:
+        r_t, Me, gamma = params["throat_radius"], params["Me"], params["gamma"]
+        gp1, gm1   = gamma+1.0, gamma-1.0
+        ar = (1.0/Me)*((2.0/gp1)*(1.0+0.5*gm1*Me**2))**(0.5*gp1/gm1)
+        r_e    = r_t * math.sqrt(ar)
+        length = (r_e-r_t) / math.tan(math.radians(self._c.half_cone_angle_deg))
+        return {"throat_radius": r_t, "exit_radius": r_e, "area_ratio": ar, "nozzle_length": length}
+
+    def calculate_mass(self, geo: Dict[str, float], params: Dict[str, float]) -> float:
+        r_t, r_e, L = geo["throat_radius"], geo["exit_radius"], geo["nozzle_length"]
+        slant = math.sqrt(L**2 + (r_e-r_t)**2)
+        return math.pi*(r_t+r_e)*slant * self._c.wall_thickness_m * self._c.material_density_kg_m3
+
+    def export_geometry(self, geo: Dict[str, float]) -> str:
+        return (f"Nozzle:\n  Throat r={geo['throat_radius']:.4f} m  "
+                f"Exit r={geo['exit_radius']:.4f} m  "
+                f"AR={geo['area_ratio']:.3f}  L={geo['nozzle_length']:.4f} m")
+
+
+class NozzleSimulator(AbstractSimulator):
+    def __init__(self, ax: NozzleAxioms) -> None: self._ax = ax
+    def simulate(self, params: Dict[str, float]) -> Dict[str, float]:
+        s = dict(params)
+        s["exit_mach"]        = self._ax.evaluate("exit_mach", s)
+        s["Me"]               = s["exit_mach"]
+        s["exit_velocity"]    = self._ax.evaluate("exit_velocity", s)
+        s["thrust"]           = self._ax.evaluate("thrust", s)
+        s["specific_impulse"] = self._ax.evaluate("specific_impulse", s)
+        return s
+
+
+class NozzleEvaluator(AbstractEvaluator):
+    def __init__(self, ax: NozzleAxioms, gen: NozzleGeometryGenerator) -> None:
+        self._ax, self._gen, self._sim = ax, gen, NozzleSimulator(ax)
+
+    @property
+    def tolerance_params(self) -> List[str]: return ["throat_radius", "T0", "P0"]
+
+    def evaluate(self, params: Dict[str, float]) -> Dict[str, Any]:
+        p = dict(params)
+        geo = self._gen.generate_geometry(p)
+        p["area_ratio"] = geo["area_ratio"]
+        mass = self._gen.calculate_mass(geo, p)
+        sim  = self._sim.simulate(p)
+        typed = NozzleResults(exit_mach=sim["exit_mach"], exit_velocity=sim["exit_velocity"],
+                              thrust=sim["thrust"], specific_impulse=sim["specific_impulse"],
+                              area_ratio=geo["area_ratio"], mass=mass,
+                              throat_radius=geo["throat_radius"], exit_radius=geo["exit_radius"],
+                              nozzle_length=geo["nozzle_length"])
+        out = typed.scalar_metrics(); out["geometry"] = geo; return out
+
+
+class NozzleDomain(HardwareDomain):
+    def _cache(self, name: str, factory: Callable) -> Any:
+        if not hasattr(self, name): object.__setattr__(self, name, factory())
+        return getattr(self, name)
+
+    @property
+    def axioms(self)            -> NozzleAxioms:           return self._cache("_ax",  NozzleAxioms)
+    @property
+    def constraints(self)       -> NozzleConstraints:      return self._cache("_con", NozzleConstraints)
+    @property
+    def geometry_generator(self) -> NozzleGeometryGenerator:
+        return self._cache("_gen", lambda: NozzleGeometryGenerator(self.constraints))
+    @property
+    def evaluator(self) -> NozzleEvaluator:
+        return self._cache("_ev", lambda: NozzleEvaluator(self.axioms, self.geometry_generator))
+
+    @property
+    def default_weights(self) -> Dict[str, float]:
+        return {"specific_impulse": -1.0, "mass": 0.1}
+
+    def _build_objective(self) -> WeightedObjective:
+        c = self.constraints
+        return WeightedObjective([
+            ObjectiveTerm("specific_impulse", -1.0, 300.0,
+                          ("ge", c.min_specific_impulse_s), 200.0),
+            ObjectiveTerm("mass", 0.1, 5.0),
+        ], self.effective_weights())
+
+    @property
+    def optimizer(self) -> GenericOptimizer:
+        wo = self._build_objective()
+        return GenericOptimizer(self.evaluator, wo,
+                                wo.constraint_funcs_from_terms(self.evaluator, self.effective_design_vars()),
+                                self.effective_design_vars())
+
+    @property
+    def design_vars(self) -> List[Tuple[str, Tuple[float, float]]]:
+        return [("Me", (2.0, 5.0)), ("throat_radius", (0.02, 0.10))]
+
+    @property
+    def constraint_funcs(self) -> List[Callable[[np.ndarray, Dict[str, float]], float]]:
+        return self._build_objective().constraint_funcs_from_terms(
+            self.evaluator, self.effective_design_vars())
+
+    @property
+    def default_params(self) -> Dict[str, float]: return NozzleParams().to_dict()
+    def default_tols(self) -> Dict[str, float]: return {"throat_radius": 0.005, "T0": 0.01, "P0": 0.02}
+
+
+# =============================================================================
+# §12  ELECTRIC MOTOR DOMAIN
+# =============================================================================
+
+def _pmsm_flux_linkage(subs: Dict[str, float]) -> float:
+    p = subs["pole_pairs"]
+    tau = math.pi * subs["rotor_radius"] / p
+    return subs["B_gap"]*tau*subs["stack_length"]*subs.get("winding_factor",0.93)*subs["turns_per_phase"]/p
+
+def _pmsm_torque(subs: Dict[str, float]) -> float:
+    psi = subs["flux_linkage_pm"] if "flux_linkage_pm" in subs else _pmsm_flux_linkage(subs)
+    return 1.5 * subs["pole_pairs"] * psi * subs["current_q"]
+
+def _pmsm_power(subs: Dict[str, float]) -> float:
+    T = subs["torque"] if "torque" in subs else _pmsm_torque(subs)
+    return T * subs["omega_mech"]
+
+def _pmsm_power_density(subs: Dict[str, float]) -> float:
+    P_kW = (subs["power"] if "power" in subs else _pmsm_power(subs)) / 1000.0
+    m    = subs["mass_total"]
+    return P_kW/m if m > 1e-9 else 0.0
+
+def _build_motor_registry() -> PhysicsRegistry:
+    reg = PhysicsRegistry("electric_motor")
+    reg.register({"flux_linkage_pm": _pmsm_flux_linkage, "torque": _pmsm_torque,
+                  "power": _pmsm_power, "power_density": _pmsm_power_density})
+    return reg
+
+
+class ElectricMotorAxioms(AbstractAxioms):
+    def __init__(self) -> None: self._reg = _build_motor_registry()
+    def evaluate(self, q: str, s: Dict[str, float]) -> float: return self._reg.evaluate(q, s)
+
+
+@dataclass
+class ElectricMotorConstraints(AbstractConstraints):
+    max_current_density_A_mm2: float = 8.0;    max_B_gap_T: float = 1.05
+    min_torque_Nm: float = 50.0;               density_iron_kg_m3: float = 7650.0
+    density_copper_kg_m3: float = 8960.0;      density_magnet_kg_m3: float = 7500.0
+    airgap_m: float = 0.001;                   stator_yoke_thickness_m: float = 0.015
+    stator_outer_extra_m: float = 0.025;       slot_area_factor_m2_per_m: float = 0.0008
+    copper_fill_factor: float = 0.40;          rotor_iron_vol_frac: float = 0.60
+    stator_iron_vol_frac: float = 0.50;        magnet_surface_frac: float = 0.15
+    magnet_radial_depth_frac: float = 0.40;    housing_mass_frac: float = 0.20
+    conductor_area_m2: float = 50e-6
+
+
+class ElectricMotorGeometryGenerator(AbstractGeometryGenerator):
+    def __init__(self, c: ElectricMotorConstraints) -> None: self._c = c
+
+    def generate_geometry(self, params: Dict[str, float]) -> Dict[str, float]:
+        r_r, L, c = params["rotor_radius"], params["stack_length"], self._c
+        r_si = r_r + c.airgap_m + c.stator_yoke_thickness_m
+        r_so = r_si + c.stator_outer_extra_m
+        return {"r_rotor": r_r, "r_stator_inner": r_si, "r_stator_outer": r_so,
+                "stack_length": L, "slot_area": c.slot_area_factor_m2_per_m*L}
+
+    def calculate_mass(self, geo: Dict[str, float], params: Dict[str, float]) -> float:
+        c = self._c
+        r_r, r_si, r_so, L = geo["r_rotor"], geo["r_stator_inner"], geo["r_stator_outer"], geo["stack_length"]
+        vol_ri  = math.pi*r_r**2*L*c.rotor_iron_vol_frac
+        vol_si  = math.pi*(r_so**2-r_si**2)*L*c.stator_iron_vol_frac
+        vol_mag = math.pi*r_r*L*c.magnet_surface_frac*c.magnet_radial_depth_frac
+        vol_cu  = geo["slot_area"]*c.copper_fill_factor
+        m_active = ((vol_ri+vol_si)*c.density_iron_kg_m3 + vol_cu*c.density_copper_kg_m3
+                    + vol_mag*c.density_magnet_kg_m3)
+        return m_active*(1.0+c.housing_mass_frac)
+
+    def export_geometry(self, geo: Dict[str, float]) -> str:
+        return (f"PMSM:\n  Rotor r={geo['r_rotor']:.4f} m  "
+                f"Stator outer r={geo['r_stator_outer']:.4f} m  "
+                f"L={geo['stack_length']:.4f} m  "
+                f"Slot area={geo['slot_area']*1e6:.1f} mm²")
+
+
+class ElectricMotorSimulator(AbstractSimulator):
+    def __init__(self, ax: ElectricMotorAxioms) -> None: self._ax = ax
+    def simulate(self, params: Dict[str, float]) -> Dict[str, float]:
+        s = dict(params)
+        s["flux_linkage_pm"] = self._ax.evaluate("flux_linkage_pm", s)
+        s["torque"]          = self._ax.evaluate("torque", s)
+        s["power"]           = self._ax.evaluate("power", s)
+        s["power_density"]   = self._ax.evaluate("power_density", s)
+        return s
+
+
+class ElectricMotorEvaluator(AbstractEvaluator):
+    def __init__(self, ax: ElectricMotorAxioms, gen: ElectricMotorGeometryGenerator,
+                 c: ElectricMotorConstraints) -> None:
+        self._ax, self._gen, self._c = ax, gen, c
+        self._sim = ElectricMotorSimulator(ax)
+
+    @property
+    def tolerance_params(self) -> List[str]: return ["rotor_radius", "stack_length", "B_gap"]
+
+    def evaluate(self, params: Dict[str, float]) -> Dict[str, Any]:
+        p = dict(params)
+        geo  = self._gen.generate_geometry(p)
+        mass = self._gen.calculate_mass(geo, p)
+        p["mass_total"] = mass
+        sim  = self._sim.simulate(p)
+        j    = p["current_q"] / (self._c.conductor_area_m2 * 1e6)
+        typed = MotorResults(flux_linkage_pm=sim["flux_linkage_pm"], torque=sim["torque"],
+                             power=sim["power"], power_density=sim["power_density"],
+                             current_density=j, mass=mass,
+                             r_rotor=geo["r_rotor"], r_stator_inner=geo["r_stator_inner"],
+                             r_stator_outer=geo["r_stator_outer"], stack_length=geo["stack_length"],
+                             slot_area=geo["slot_area"])
+        out = typed.scalar_metrics(); out["geometry"] = geo; return out
+
+
+class ElectricMotorDomain(HardwareDomain):
+    def _cache(self, name: str, factory: Callable) -> Any:
+        if not hasattr(self, name): object.__setattr__(self, name, factory())
+        return getattr(self, name)
+
+    @property
+    def axioms(self)      -> ElectricMotorAxioms:      return self._cache("_ax",  ElectricMotorAxioms)
+    @property
+    def constraints(self) -> ElectricMotorConstraints: return self._cache("_con", ElectricMotorConstraints)
+    @property
+    def geometry_generator(self) -> ElectricMotorGeometryGenerator:
+        return self._cache("_gen", lambda: ElectricMotorGeometryGenerator(self.constraints))
+    @property
+    def evaluator(self) -> ElectricMotorEvaluator:
+        return self._cache("_ev", lambda: ElectricMotorEvaluator(
+            self.axioms, self.geometry_generator, self.constraints))
+
+    @property
+    def default_weights(self) -> Dict[str, float]:
+        return {"power_density": -1.0, "torque": -0.2, "current_density": 0.5, "mass": 0.05}
+
+    def _build_objective(self) -> WeightedObjective:
+        c = self.constraints
+        return WeightedObjective([
+            ObjectiveTerm("power_density",   -1.0, 0.5),
+            ObjectiveTerm("torque",          -0.2, c.min_torque_Nm,
+                          ("ge", c.min_torque_Nm), 100.0),
+            ObjectiveTerm("current_density",  0.5, c.max_current_density_A_mm2,
+                          ("le", c.max_current_density_A_mm2), 100.0),
+            ObjectiveTerm("mass",             0.05, 40.0),
+        ], self.effective_weights())
+
+    @property
+    def optimizer(self) -> GenericOptimizer:
+        wo = self._build_objective()
+        return GenericOptimizer(self.evaluator, wo,
+                                wo.constraint_funcs_from_terms(self.evaluator, self.effective_design_vars()),
+                                self.effective_design_vars())
+
+    @property
+    def design_vars(self) -> List[Tuple[str, Tuple[float, float]]]:
+        return [("rotor_radius",(0.04,0.12)), ("stack_length",(0.08,0.25)),
+                ("B_gap",(0.70,1.05)),        ("current_q",(100.0,400.0))]
+
+    @property
+    def constraint_funcs(self) -> List[Callable[[np.ndarray, Dict[str, float]], float]]:
+        return self._build_objective().constraint_funcs_from_terms(
+            self.evaluator, self.effective_design_vars())
+
+    @property
+    def default_params(self) -> Dict[str, float]: return MotorParams().to_dict()
+    def default_tols(self) -> Dict[str, float]: return {"rotor_radius": 0.002, "stack_length": 0.003, "B_gap": 0.01}
+
+
+# =============================================================================
+# §13  CENTRIFUGAL PUMP DOMAIN
+# =============================================================================
+# Euler turbomachinery + Cordier efficiency + Stodola slip factor
+# Head:   H = σ·u2·(u2 - V_r2/tan β2)/g
+# Power:  P = ρ·g·Q·H / η_h
+# Ns_dim: ω√Q / (gH)^0.75  (dimensionless)
+
+def _pump_tip_speed(subs: Dict[str, float]) -> float:
+    return math.pi * subs["rotational_speed_rpm"] * subs["impeller_diameter_m"] / 60.0
+
+def _pump_slip_factor(subs: Dict[str, float]) -> float:
+    beta2 = math.radians(subs["blade_angle_deg"])
+    return 1.0 - math.pi * math.sin(beta2) / subs["n_blades"]
+
+def _pump_radial_velocity(subs: Dict[str, float]) -> float:
+    D2 = subs["impeller_diameter_m"]
+    b2 = subs["blade_width_ratio"] * D2
+    return subs["flow_rate_m3s"] / (math.pi * D2 * b2)
+
+def _pump_head(subs: Dict[str, float]) -> float:
+    g     = 9.80665
+    u2    = subs.get("tip_speed",       _pump_tip_speed(subs))
+    sigma = subs.get("slip_factor",     _pump_slip_factor(subs))
+    V_r2  = subs.get("radial_velocity", _pump_radial_velocity(subs))
+    tan_b = max(abs(math.tan(math.radians(subs["blade_angle_deg"]))), 1e-9)
+    return sigma * u2 * (u2 - V_r2 / tan_b) / g
+
+def _pump_specific_speed(subs: Dict[str, float]) -> float:
+    g     = 9.80665
+    H     = subs.get("head", _pump_head(subs))
+    if H <= 0: return 0.0
+    omega = subs["rotational_speed_rpm"] * math.pi / 30.0
+    return omega * math.sqrt(subs["flow_rate_m3s"]) / (g * H) ** 0.75
+
+def _pump_hydraulic_efficiency(subs: Dict[str, float]) -> float:
+    Ns  = subs.get("specific_speed", _pump_specific_speed(subs))
+    eta = 0.65 + 0.30 * math.exp(-0.8 * (Ns - 0.6) ** 2)
+    return max(0.50, min(0.92, eta))
+
+def _pump_shaft_power(subs: Dict[str, float]) -> float:
+    g   = 9.80665
+    H   = subs.get("head", _pump_head(subs))
+    eta = subs.get("hydraulic_efficiency", _pump_hydraulic_efficiency(subs))
+    return subs["fluid_density_kgm3"] * g * subs["flow_rate_m3s"] * H / max(eta, 1e-6)
+
+def _pump_npsh_r(subs: Dict[str, float]) -> float:
+    g     = 9.80665
+    u2    = subs.get("tip_speed", _pump_tip_speed(subs))
+    r2    = subs["impeller_diameter_m"] / 2.0
+    r1    = r2 * subs["inlet_diameter_ratio"]
+    omega = subs["rotational_speed_rpm"] * math.pi / 30.0
+    u1    = omega * r1
+    return (u2**2 / (2*g)) * (1 + (u1/u2)**2) * 0.1
+
+def _build_pump_registry() -> PhysicsRegistry:
+    reg = PhysicsRegistry("centrifugal_pump")
+    reg.register({"tip_speed": _pump_tip_speed, "slip_factor": _pump_slip_factor,
+                  "radial_velocity": _pump_radial_velocity, "head": _pump_head,
+                  "specific_speed": _pump_specific_speed,
+                  "hydraulic_efficiency": _pump_hydraulic_efficiency,
+                  "shaft_power": _pump_shaft_power, "npsh_r": _pump_npsh_r})
+    return reg
+
+
+class PumpAxioms(AbstractAxioms):
+    def __init__(self) -> None: self._reg = _build_pump_registry()
+    def evaluate(self, q: str, s: Dict[str, float]) -> float: return self._reg.evaluate(q, s)
+
+
+@dataclass
+class PumpConstraints(AbstractConstraints):
+    min_head_m: float = 40.0;              max_npsh_r_m: float = 8.0
+    max_shaft_power_W: float = 80_000.0;   min_efficiency: float = 0.55
+    max_tip_speed_m_s: float = 40.0;       impeller_density_kg_m3: float = 7800.0
+    impeller_thickness_m: float = 0.008
+
+
+class PumpGeometryGenerator(AbstractGeometryGenerator):
+    def __init__(self, c: PumpConstraints) -> None: self._c = c
+
+    def generate_geometry(self, params: Dict[str, float]) -> Dict[str, float]:
+        D2 = params["impeller_diameter_m"]
+        return {"impeller_diameter": D2, "blade_width": params["blade_width_ratio"]*D2,
+                "inlet_diameter": params["inlet_diameter_ratio"]*D2,
+                "blade_angle_deg": params["blade_angle_deg"]}
+
+    def calculate_mass(self, geo: Dict[str, float], params: Dict[str, float]) -> float:
+        D2, b2, t, rho = geo["impeller_diameter"], geo["blade_width"], \
+                         self._c.impeller_thickness_m, self._c.impeller_density_kg_m3
+        disk_vol  = math.pi * (D2/2)**2 * t
+        blade_vol = params["n_blades"] * D2 * b2 * t * 0.5
+        return (disk_vol + blade_vol) * rho
+
+    def export_geometry(self, geo: Dict[str, float]) -> str:
+        return (f"Pump impeller:\n  D2={geo['impeller_diameter']*1000:.1f} mm  "
+                f"b2={geo['blade_width']*1000:.1f} mm  "
+                f"D1={geo['inlet_diameter']*1000:.1f} mm  "
+                f"β2={geo['blade_angle_deg']:.1f}°")
+
+
+class PumpSimulator(AbstractSimulator):
+    def __init__(self, ax: PumpAxioms) -> None: self._ax = ax
+    def simulate(self, params: Dict[str, float]) -> Dict[str, float]:
+        s = dict(params)
+        s["tip_speed"]            = self._ax.evaluate("tip_speed", s)
+        s["slip_factor"]          = self._ax.evaluate("slip_factor", s)
+        s["radial_velocity"]      = self._ax.evaluate("radial_velocity", s)
+        s["head"]                 = self._ax.evaluate("head", s)
+        s["specific_speed"]       = self._ax.evaluate("specific_speed", s)
+        s["hydraulic_efficiency"] = self._ax.evaluate("hydraulic_efficiency", s)
+        s["shaft_power"]          = self._ax.evaluate("shaft_power", s)
+        s["npsh_r"]               = self._ax.evaluate("npsh_r", s)
+        return s
+
+
+class PumpEvaluator(AbstractEvaluator):
+    def __init__(self, ax: PumpAxioms, gen: PumpGeometryGenerator, c: PumpConstraints) -> None:
+        self._ax, self._gen, self._c = ax, gen, c
+        self._sim = PumpSimulator(ax)
+
+    @property
+    def tolerance_params(self) -> List[str]:
+        return ["impeller_diameter_m", "blade_angle_deg", "rotational_speed_rpm"]
+
+    def evaluate(self, params: Dict[str, float]) -> Dict[str, Any]:
+        p = dict(params)
+        geo  = self._gen.generate_geometry(p)
+        mass = self._gen.calculate_mass(geo, p)
+        sim  = self._sim.simulate(p)
+        typed = PumpResults(head_m=sim["head"], shaft_power_W=sim["shaft_power"],
+                            hydraulic_efficiency=sim["hydraulic_efficiency"],
+                            specific_speed=sim["specific_speed"], tip_speed_m_s=sim["tip_speed"],
+                            mass_impeller_kg=mass,
+                            power_per_kg_W_kg=sim["shaft_power"]/max(mass,1e-9),
+                            npsh_r_m=sim["npsh_r"])
+        out = typed.scalar_metrics(); out["geometry"] = geo; return out
+
+
+class CentrifugalPumpDomain(HardwareDomain):
+    def _cache(self, name: str, factory: Callable) -> Any:
+        if not hasattr(self, name): object.__setattr__(self, name, factory())
+        return getattr(self, name)
+
+    @property
+    def axioms(self)      -> PumpAxioms:       return self._cache("_ax",  PumpAxioms)
+    @property
+    def constraints(self) -> PumpConstraints:  return self._cache("_con", PumpConstraints)
+    @property
+    def geometry_generator(self) -> PumpGeometryGenerator:
+        return self._cache("_gen", lambda: PumpGeometryGenerator(self.constraints))
+    @property
+    def evaluator(self) -> PumpEvaluator:
+        return self._cache("_ev", lambda: PumpEvaluator(
+            self.axioms, self.geometry_generator, self.constraints))
+
+    @property
+    def default_weights(self) -> Dict[str, float]:
+        return {"shaft_power_W": 1.0, "hydraulic_efficiency": -2.0,
+                "head_m": -0.3, "npsh_r_m": 0.1}
+
+    def _build_objective(self) -> WeightedObjective:
+        c = self.constraints
+        return WeightedObjective([
+            ObjectiveTerm("shaft_power_W",        1.0, 30_000.0,  ("le", c.max_shaft_power_W),  100.0),
+            ObjectiveTerm("hydraulic_efficiency", -2.0, 0.75,     ("ge", c.min_efficiency),     200.0),
+            ObjectiveTerm("head_m",               -0.3, c.min_head_m, ("ge", c.min_head_m),     200.0),
+            ObjectiveTerm("npsh_r_m",              0.1, 4.0,      ("le", c.max_npsh_r_m),        50.0),
+            ObjectiveTerm("tip_speed_m_s",         0.0, c.max_tip_speed_m_s,
+                          ("le", c.max_tip_speed_m_s), 100.0),
+        ], self.effective_weights())
+
+    @property
+    def optimizer(self) -> GenericOptimizer:
+        wo = self._build_objective()
+        return GenericOptimizer(self.evaluator, wo,
+                                wo.constraint_funcs_from_terms(self.evaluator, self.effective_design_vars()),
+                                self.effective_design_vars())
+
+    @property
+    def design_vars(self) -> List[Tuple[str, Tuple[float, float]]]:
+        return [("impeller_diameter_m", (0.15, 0.50)),
+                ("blade_angle_deg",     (15.0, 45.0)),
+                ("rotational_speed_rpm",(800.0, 3000.0))]
+
+    @property
+    def constraint_funcs(self) -> List[Callable[[np.ndarray, Dict[str, float]], float]]:
+        return self._build_objective().constraint_funcs_from_terms(
+            self.evaluator, self.effective_design_vars())
+
+    @property
+    def default_params(self) -> Dict[str, float]: return PumpParams().to_dict()
+    def default_tols(self) -> Dict[str, float]:
+        return {"impeller_diameter_m": 0.003, "blade_angle_deg": 0.02, "rotational_speed_rpm": 0.005}
+
+
+# =============================================================================
+# §14  DOMAIN FACTORY
+# =============================================================================
+
+_DOMAIN_MAP: Dict[str, Type[HardwareDomain]] = {
+    "nozzle":           NozzleDomain,
+    "electric_motor":   ElectricMotorDomain,
+    "centrifugal_pump": CentrifugalPumpDomain,
+}
+
+
+def get_domain(name: str, config: DomainConfig) -> HardwareDomain:
+    if name not in _DOMAIN_MAP:
+        raise ValueError(f"Domain '{name}' not supported. Available: {sorted(_DOMAIN_MAP)}")
+    return _DOMAIN_MAP[name](config)
+
+
+def get_optimizer(domain_obj: HardwareDomain, mode: SamplingMode, de_seed: int = 0) -> AbstractOptimizer:
+    if mode == "differential_evo":
+        wo    = domain_obj._build_objective()
+        dvars = domain_obj.effective_design_vars()
+        cons  = wo.constraint_funcs_from_terms(domain_obj.evaluator, dvars)
+        return DifferentialEvolutionOptimizer(domain_obj.evaluator, wo, cons, dvars, de_seed=de_seed)
+    return domain_obj.optimizer
+
+
+# =============================================================================
+# §15  RUNNER
+# =============================================================================
+
+
+def _sep(char: str = "=", width: int = 68) -> None: print(char * width)
+
+
+def _print_result(result: OptimResult, generator: AbstractGeometryGenerator,
+                  domain_name: str, label: str = "") -> None:
+    status = "SUCCEEDED" if result.success else "DID NOT CONVERGE"
+    tag    = f"  [{label}]" if label else ""
+    _sep()
+    print(f"  {domain_name.upper()}{tag}  |  {status}  ({result.n_iter} iters, {result.elapsed_s:.2f}s)")
+    _sep()
+    print(f"  Objective value : {result.objective_value:.6g}")
+    print("\nOptimised design variables:")
+    for k, v in result.optimized_params.items():
+        if isinstance(v, (int, float)):
+            print(f"  {k:<36} = {v:.6g}")
+    print("\nPerformance metrics:")
+    for k, v in result.scalar_results().items():
+        print(f"  {k:<36} = {v:.6g}")
+    geo = result.results.get("geometry")
+    if geo: print(); print(generator.export_geometry(geo))
+
+
+def run_single(domain_obj: HardwareDomain, domain_name: str,
+               optimizer: AbstractOptimizer) -> OptimResult:
+    params = domain_obj.effective_params()
+    _sep(); print(f"  Hardware Optimiser – {domain_name.upper()}  [single]"); _sep()
+    print("Effective initial parameters:")
+    for k, v in params.items(): print(f"  {k:<36} = {v}")
+    print()
+    result = optimizer.optimize_design(params)
+    _print_result(result, domain_obj.geometry_generator, domain_name, label="single")
+    _sep(); return result
+
+
+def run_sampling(domain_obj: HardwareDomain, domain_name: str, optimizer: AbstractOptimizer,
+                 mode: SamplingMode, n_runs: int, seed: int) -> OptimResult:
+    params = domain_obj.effective_params()
+    dvars  = domain_obj.effective_design_vars()
+    _sep(); print(f"  Hardware Optimiser – {domain_name.upper()}  [{mode}  n={n_runs}  seed={seed}]"); _sep()
+    ms = run_multistart(optimizer, params, dvars, mode=mode, n_runs=n_runs, seed=seed)
+    print(f"\n{ms.summary_table()}\n")
+    print("── GLOBAL BEST " + "─" * 53)
+    _print_result(ms.best, domain_obj.geometry_generator, domain_name, label="best")
+    _sep(); return ms.best
+
+
+def run_differential_evo(domain_obj: HardwareDomain, domain_name: str,
+                         optimizer: DifferentialEvolutionOptimizer) -> OptimResult:
+    params = domain_obj.effective_params()
+    _sep(); print(f"  Hardware Optimiser – {domain_name.upper()}  [differential_evolution]"); _sep()
+    result = optimizer.optimize_design(params)
+    _print_result(result, domain_obj.geometry_generator, domain_name, label="DE+polish")
+    _sep(); return result
+
+
+def run_tolerance_study(best_result: OptimResult, domain_obj: HardwareDomain,
+                        domain_name: str, n_samples: int, seed: int,
+                        config_tols: Dict[str, float]) -> None:
+    _sep("-"); print(f"  Tolerance MC – {domain_name.upper()}  (n={n_samples}, seed={seed})"); _sep("-")
+    tols_all   = {**domain_obj.default_tols(), **config_tols}
+    tol_params = {k: tols_all[k] for k in domain_obj.evaluator.tolerance_params if k in tols_all}
+    if not tol_params:
+        log.warning("No tolerance params resolved for '%s'. Skipping.", domain_name); return
+    mc = run_tolerance_mc(
+        best_params=best_result.optimized_params, evaluator=domain_obj.evaluator,
+        constraint_funcs=domain_obj.constraint_funcs, design_vars=domain_obj.effective_design_vars(),
+        tols=tol_params, n_samples=n_samples, seed=seed)
+    print(mc.report()); _sep("-")
+
+
+# =============================================================================
+# §16  UNIT TESTS  (--test flag)
+# =============================================================================
+
+
+def _run_tests() -> None:
+    """
+    8 high-value unit tests.  No pytest required; run with --test.
+    Covers physics functions, the weighted objective framework, and
+    DomainConfig config plumbing.
+    """
+    passed: List[str] = []
+    failed: List[str] = []
+
+    def _test(name: str, fn: Callable[[], None]) -> None:
+        try:
+            fn()
+            passed.append(name); print(f"  PASS  {name}")
+        except Exception as exc:
+            failed.append(name); print(f"  FAIL  {name}: {exc}")
+            _tb.print_exc()
+
+    print("\n" + "="*60 + "\n  Unit Tests\n" + "="*60)
+
+    # T1 – Nozzle exit velocity: known isentropic formula
+    def _t1() -> None:
+        subs = {"gamma": 1.4, "R": 287.0, "T0": 300.0, "Me": 2.0}
+        Ve       = _nozzle_exit_velocity(subs)
+        expected = 2.0 * math.sqrt(1.4 * 287.0 * 300.0 / (1.0 + 0.2 * 4.0))
+        assert abs(Ve - expected) < 0.05, f"Ve={Ve:.3f}  expected={expected:.3f}"
+
+    # T2 – Nozzle area-ratio Brent solver round-trip
+    def _t2() -> None:
+        gamma, Me_in = 1.4, 2.5
+        gp1, gm1 = gamma+1.0, gamma-1.0
+        ar = (1.0/Me_in)*((2.0/gp1)*(1.0+0.5*gm1*Me_in**2))**(0.5*gp1/gm1)
+        Me_out = _nozzle_exit_mach({"gamma": gamma, "area_ratio": ar})
+        assert abs(Me_out - Me_in) < 1e-6, f"Round-trip err={abs(Me_out-Me_in):.2e}"
+
+    # T3 – PMSM torque: direct manual check
+    # Supply flux_linkage_pm explicitly so the fallback branch is not taken.
+    # T = 1.5 * p * psi * I_q = 1.5 * 4 * 0.05 * 100 = 30.0 Nm
+    def _t3() -> None:
+        subs = {"pole_pairs": 4.0, "flux_linkage_pm": 0.05, "current_q": 100.0,
+                "rotor_radius": 0.07}   # extra key harmless; avoids fallback KeyError
+        T = _pmsm_torque(subs)
+        assert abs(T - 30.0) < 1e-9, f"Torque={T}  expected=30.0"
+
+    # T4 – PMSM power density: energy chain consistency
+    def _t4() -> None:
+        subs = {"pole_pairs":4.0,"rotor_radius":0.07,"stack_length":0.12,
+                "B_gap":0.85,"winding_factor":0.933,"turns_per_phase":12.0,
+                "current_q":200.0,"omega_mech":300.0,"mass_total":10.0}
+        psi  = _pmsm_flux_linkage(subs)
+        subs2 = {**subs, "flux_linkage_pm": psi}
+        T    = _pmsm_torque(subs2)
+        subs3 = {**subs2, "torque": T}
+        P    = _pmsm_power(subs3)
+        subs4 = {**subs3, "power": P}
+        pd   = _pmsm_power_density(subs4)
+        assert abs(pd - P/1000.0/10.0) < 1e-9, f"PD chain error: pd={pd}"
+
+    # T5 – Pump tip speed formula
+    def _t5() -> None:
+        subs = {"rotational_speed_rpm": 1450.0, "impeller_diameter_m": 0.25}
+        expected = math.pi * 1450.0 * 0.25 / 60.0
+        assert abs(_pump_tip_speed(subs) - expected) < 1e-9
+
+    # T6 – Pump head plausibility for default params
+    def _t6() -> None:
+        p = PumpParams()
+        s = p.to_dict()
+        s["tip_speed"]       = _pump_tip_speed(s)
+        s["slip_factor"]     = _pump_slip_factor(s)
+        s["radial_velocity"] = _pump_radial_velocity(s)
+        H = _pump_head(s)
+        assert 5.0 < H < 800.0, f"Head implausible: {H:.1f} m"
+
+    # T7 – WeightedObjective: at nominal → zero; above nominal improves objective
+    def _t7() -> None:
+        terms = [ObjectiveTerm("eff", -1.0, 0.8)]
+        wo = WeightedObjective(terms, {})
+        assert wo({"eff": 0.8}) == 0.0, "Nominal must give zero"
+        assert wo({"eff": 1.0}) < wo({"eff": 0.5}), "Higher eff must give lower obj"
+
+    # T8 – DomainConfig bound override flows through effective_design_vars
+    def _t8() -> None:
+        cfg = DomainConfig(bounds={"impeller_diameter_m": (0.10, 0.60)})
+        dvars = dict(CentrifugalPumpDomain(cfg).effective_design_vars())
+        lo, hi = dvars["impeller_diameter_m"]
+        assert abs(lo-0.10)<1e-9 and abs(hi-0.60)<1e-9, f"Got ({lo},{hi})"
+
+    for name, fn in [
+        ("T1 Nozzle exit velocity",         _t1),
+        ("T2 Nozzle area-ratio round-trip", _t2),
+        ("T3 PMSM torque formula",          _t3),
+        ("T4 PMSM power density chain",     _t4),
+        ("T5 Pump tip speed formula",       _t5),
+        ("T6 Pump head plausibility",       _t6),
+        ("T7 WeightedObjective normalise",  _t7),
+        ("T8 DomainConfig bound override",  _t8),
+    ]:
+        _test(name, fn)
+
+    print("="*60)
+    print(f"  {len(passed)} passed  |  {len(failed)} failed")
+    print("="*60 + "\n")
+    if failed:
+        raise SystemExit(1)
+
+
+# =============================================================================
+# §17  CLI ENTRY-POINT
+# =============================================================================
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Abstract Hardware Design Optimiser  v4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python hardware_optimiser.py --domain centrifugal_pump\n"
+            "  python hardware_optimiser.py --domain electric_motor --mode differential_evo\n"
+            "  python hardware_optimiser.py --domain nozzle --mode sobol --n-runs 64 --seed 7\n"
+            "  python hardware_optimiser.py --domain electric_motor --tolerance-mc 2000 --seed 42\n"
+            "  python hardware_optimiser.py --test\n"
+        ),
+    )
+    parser.add_argument("--domain",   default="electric_motor", choices=list(_DOMAIN_MAP))
+    parser.add_argument("--mode",     default="single",
+                        choices=["single","monte_carlo","sobol","differential_evo"])
+    parser.add_argument("--n-runs",   type=int, default=32, metavar="N")
+    parser.add_argument("--seed",     type=int, default=0)
+    parser.add_argument("--config",   default=None, metavar="FILE")
+    parser.add_argument("--tolerance-mc", type=int, default=0, metavar="N",
+                        help="N-sample manufacturing tolerance MC (0=off).")
+    parser.add_argument("--test",     action="store_true", help="Run unit tests and exit.")
+    parser.add_argument("--verbose",  action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.test:
+        _run_tests(); return
+
+    cfg        = DomainConfig.from_file_or_empty(args.config)
+    domain_obj = get_domain(args.domain, cfg)
+    optimizer  = get_optimizer(domain_obj, args.mode, de_seed=args.seed)
+
+    if args.mode == "single":
+        best = run_single(domain_obj, args.domain, optimizer)
+    elif args.mode == "differential_evo":
+        best = run_differential_evo(domain_obj, args.domain, optimizer)
+    else:
+        best = run_sampling(domain_obj, args.domain, optimizer,
+                            mode=args.mode, n_runs=args.n_runs, seed=args.seed)
+
+    if args.tolerance_mc > 0:
+        run_tolerance_study(best, domain_obj, args.domain,
+                            n_samples=args.tolerance_mc, seed=args.seed, config_tols=cfg.tols)
+
+
+if __name__ == "__main__":
+    main()
