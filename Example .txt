@@ -1,0 +1,41 @@
+{
+  "_comment": "Example DomainConfig for hardware_optimiser_v3.py",
+  "_comment2": "Pass with: --config example_config.json --domain centrifugal_pump",
+
+  "params": {
+    "flow_rate_m3s":      0.08,
+    "target_head_m":      60.0,
+    "fluid_density_kgm3": 998.0,
+    "n_blades":           7.0
+  },
+
+  "bounds": {
+    "impeller_diameter_m":   [0.18, 0.55],
+    "blade_angle_deg":       [18.0, 42.0],
+    "rotational_speed_rpm":  [900.0, 2800.0]
+  },
+
+  "weights": {
+    "shaft_power_W":        1.2,
+    "hydraulic_efficiency": -2.5,
+    "head_m":               -0.5,
+    "npsh_r_m":              0.2
+  },
+
+  "tols": {
+    "impeller_diameter_m":   0.004,
+    "blade_angle_deg":       0.025,
+    "rotational_speed_rpm":  0.008
+  },
+
+  "mass_models": {
+    "_comment": "Override the centrifugal_pump mass model with a lookup table.",
+    "_comment2": "Remove or change 'centrifugal_pump' key to restore physics-based model.",
+    "centrifugal_pump": {
+      "model_type": "table",
+      "x_key":      "impeller_diameter_m",
+      "x":          [0.15,  0.20,  0.25,  0.30,  0.35,  0.40,  0.50],
+      "mass_kg":    [1.2,   2.1,   3.4,   5.2,   7.8,  11.0,  19.5]
+    }
+  }
+}
